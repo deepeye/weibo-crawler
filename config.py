@@ -74,11 +74,11 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 PROXY_ENABLED = False
 
 # HTTP 代理接口配置
-PROXY_HTTP_URL = "https://exclusive.proxy.qg.net/replace?key=5CDBEC47&num=10&area=&isp=0&format=json&distinct=true&keep_alive=1440"
+PROXY_HTTP_URL = "https://exclusive.proxy.qg.net/get?key=5CDBEC47&num=5&area=&isp=0&format=json&distinct=true&keep_alive=1440"
 PROXY_HTTP_PARAMS = {}
 PROXY_AUTH_USER = "5CDBEC47"
 PROXY_AUTH_PASSWORD = "48BC8939D827"
-PROXY_RELOAD_INTERVAL = 60  # 代理池自动更新间隔（秒）
+PROXY_RELOAD_INTERVAL = 36000  # 代理池自动更新间隔（秒）
 
 # 代理失效检测阈值
 PROXY_TIMEOUT_THRESHOLD = 360  # 超时超过此秒数才标记代理失效
