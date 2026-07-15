@@ -74,7 +74,7 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 PROXY_ENABLED = False
 
 # HTTP 代理接口配置
-PROXY_HTTP_URL = "https://exclusive.proxy.qg.net/get?key=5CDBEC47&num=5&area=&isp=0&format=json&distinct=true&keep_alive=1440"
+PROXY_HTTP_URL = "https://exclusive.proxy.qg.net/get?key=5CDBEC47&num=1&area=&isp=0&format=json&distinct=true&keep_alive=1440"
 PROXY_HTTP_PARAMS = {}
 PROXY_AUTH_USER = "5CDBEC47"
 PROXY_AUTH_PASSWORD = "48BC8939D827"
