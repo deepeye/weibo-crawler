@@ -307,10 +307,11 @@ class ProxyManager:
     async def get_next_proxy(self) -> str | None:
         """获取下一个可用代理
 
-        自动跳过失效代理，循环轮询
+        自动跳过失效代理，循环轮询。当所有代理失效时，每 1 秒重新请求
+        PROXY_HTTP_URL，直到拿到新代理。
 
         Returns:
-            代理URL (http://ip:port)，无可用代理返回 None
+            代理URL (http://ip:port)，无可用代理时阻塞轮询直到拿到为止
         """
         async with self._lock:
             if not self._proxies:
@@ -324,24 +325,33 @@ class ProxyManager:
                     console.print(f"[red][PID:{pid}] 加载代理异常: {e}[/red]")
                     return None
 
-            # 最多检查整个代理池
-            checked = 0
-            while checked < len(self._proxies):
-                idx = self._current_index % len(self._proxies)
-                self._current_index += 1
+            while True:
+                # 最多检查整个代理池
+                checked = 0
+                while checked < len(self._proxies):
+                    idx = self._current_index % len(self._proxies)
+                    self._current_index += 1
 
-                # 跳过失效代理
-                if idx in self._failed_proxies:
-                    checked += 1
-                    continue
+                    # 跳过失效代理
+                    if idx in self._failed_proxies:
+                        checked += 1
+                        continue
 
-                proxy = self._proxies[idx]
-                return self._proxy_to_url(proxy)
+                    proxy = self._proxies[idx]
+                    return self._proxy_to_url(proxy)
 
-            # 所有代理都失效
-            failed_rate = len(self._failed_proxies) / len(self._proxies) * 100
-            console.print(f"[red][PID:{pid}] 代理池耗尽：所有 {len(self._proxies)} 个IP都已失效 ({failed_rate:.1f}%)[/red]")
-            return None
+                # 所有代理都失效，1 秒后重新请求接口
+                failed_rate = len(self._failed_proxies) / len(self._proxies) * 100
+                console.print(
+                    f"[red][PID:{pid}] 代理池耗尽：所有 {len(self._proxies)} 个IP都已失效 "
+                    f"({failed_rate:.1f}%)，1s 后重新请求 PROXY_HTTP_URL...[/red]"
+                )
+                await asyncio.sleep(1)
+
+                try:
+                    await self.load_proxies_from_http()
+                except Exception as e:
+                    console.print(f"[yellow][PID:{pid}] 轮询加载代理失败: {e}[/yellow]")
 
     async def mark_proxy_failed(self, proxy_url: str):
         """标记代理失效
