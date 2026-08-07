@@ -2024,77 +2024,46 @@ async def fetch_user_weibo(uid: str, page: int = 1, since_id: str = "") -> dict:
 
 
 async def fetch_weibo_longtext(mid: str) -> dict:
-    """获取指定微博的全文长文（使用代理重试方式 - 支持指纹轮换和 Cookie 自动更换）"""
+    """通过 H5 详情页获取微博完整扩展信息（statuses/extend 的 H5 等价物）。
 
+    用浏览器访问 m.weibo.cn/detail/{mid}（浏览器自动完成 Sina Visitor 流程），
+    读取页面 $render_data（含完整 mblog，长文已展开）。仅需 mid。
+    """
+    global browser_page
     pid = os.getpid()
+    detail_url = f"https://m.weibo.cn/detail/{mid}"
 
-    # 构建请求 URL
-    url = f"https://weibo.com/ajax/statuses/longtext?id={mid}"
+    async with browser_lock:
+        if not browser_page or browser_page.is_closed():
+            print(f"[PID:{pid}][微博长文/H5] 浏览器页面不可用，重新初始化...")
+            await reset_browser_with_new_fingerprint()
 
-    # 构建请求头（使用浏览器真实请求头作为参考）
-    headers = {
-        "accept": "application/json, text/plain, */*",
-        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "client-version": "3.0.0",
-        "priority": "u=1, i",
-        "referer": f"https://weibo.com/detail/{mid}",
-        "x-requested-with": "XMLHttpRequest",
-        # 重要：服务端版本号，风控可能会检查
-        "server-version": "v2026.02.06.1",
-    }
-
-    # 从数据库获取 Cookie
-    cookie_str = await get_next_cookie()
-    if not cookie_str:
-        print(f"[PID:{pid}][微博长文] ❌ 无可用 Cookie")
-        return {"ok": -1, "error": "无可用 Cookie"}
-
-    # 解析 Cookie 字符串为字典
-    cookies = parse_cookie_string(cookie_str)
-
-    # 提取 XSRF-TOKEN 并添加到请求头
-    xsrf_token = extract_xsrf_token(cookie_str)
-    if xsrf_token:
-        headers["x-xsrf-token"] = xsrf_token
-        print(f"[PID:{pid}][微博长文] 已提取 XSRF-TOKEN")
-    else:
-        print(f"[PID:{pid}][微博长文] ⚠️ 未找到 XSRF-TOKEN")
-
-    try:
-        print(f"[PID:{pid}][微博长文] 开始请求: {url}")
-
-        # 使用代理重试方式请求
-        response = await fetch_with_proxy_retry(
-            url=url,
-            headers=headers,
-            cookies=cookies,
-            method="GET",
-            max_retries=15,
-            context="微博长文"
-        )
-
-        # 处理返回结果
-        if response.status_code == 200:
-            data = response.json()
-            if data and data.get("ok") == 1:
-                print(f"[PID:{pid}][微博长文] ✅ 采集成功")
-                return data
-            elif data and data.get("ok") == -100:
-                print(f"[PID:{pid}][微博长文] ⚠️ 触发验证码或 Cookie 失效")
-                return {"ok": -1, "error": "触发验证码或 Cookie 失效"}
-            else:
-                error_msg = data.get("msg", "未知错误") if data else "无返回数据"
-                print(f"[PID:{pid}][微博长文] ❌ 返回错误: {error_msg}")
-                return {"ok": -1, "error": error_msg}
-        else:
-            error_msg = f"HTTP {response.status_code}"
-            print(f"[PID:{pid}][微博长文] ❌ 请求失败: {error_msg}")
+        print(f"[PID:{pid}][微博长文/H5] 访问详情页: {detail_url}")
+        try:
+            await browser_page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
+            # $render_data 在详情页初始 HTML 内；访客流程可能需几秒，轮询等待
+            data = None
+            for _ in range(20):
+                data = await browser_page.evaluate("() => window.$render_data || null")
+                if data:
+                    break
+                await asyncio.sleep(0.5)
+            # 兜底：从 HTML 正则提取
+            if not data:
+                html = await browser_page.content()
+                match = re.search(r'var \$render_data = \[(.*?)\]\[0\]\s*\|\|\s*\{\};', html, re.S)
+                if match:
+                    data = json.loads("[" + match.group(1) + "]")[0]
+            if data:
+                status = data.get('status') if isinstance(data, dict) else None
+                print(f"[PID:{pid}][微博长文/H5] ✅ 提取成功" + ("" if status else "（无 status 字段，返回整体）"))
+                return status if status is not None else data
+            print(f"[PID:{pid}][微博长文/H5] ❌ 未找到 $render_data")
+            return {"ok": -1, "error": "未找到 $render_data"}
+        except Exception as e:
+            error_msg = repr(e)[:200]
+            print(f"[PID:{pid}][微博长文/H5] ❌ 异常: {error_msg}")
             return {"ok": -1, "error": error_msg}
-
-    except Exception as e:
-        error_msg = str(e)
-        print(f"[PID:{pid}][微博长文] ❌ 异常: {error_msg[:200]}")
-        return {"ok": -1, "error": error_msg}
 
 
 async def fetch_user_profile(uid: str) -> dict:
@@ -2254,17 +2223,17 @@ async def get_user_profile(
 
 @app.get("/weibo/longtext")
 async def get_weibo_longtext(
-    id: str = Query(..., description="微博 ID（mid）", min_length=1),
+    mid: str = Query(..., description="微博 MID", min_length=1),
 ):
     """
-    获取指定微博的全文长文
+    通过 H5 详情页获取微博完整扩展信息（statuses/extend 的 H5 等价物）
 
-    - **id**: 微博 ID（mid）
+    - **mid**: 微博 MID
 
-    返回微博长文 API 的原始 JSON 响应（data.longTextContent 即全文）
-    Cookie 采用轮询方式，每次请求更换一个
+    抓取 m.weibo.cn/detail/{mid}，提取 $render_data（含完整 mblog，长文已展开）。
+    公开页面，无需 Cookie/签名。uid 在 H5 路径不需要（传入会被忽略）。
     """
-    response = await fetch_weibo_longtext(id)
+    response = await fetch_weibo_longtext(mid)
     return JSONResponse(content=response)
 
 
