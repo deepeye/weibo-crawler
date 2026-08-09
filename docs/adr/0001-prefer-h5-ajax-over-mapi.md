@@ -1,7 +1,7 @@
 # Prefer cookie-based H5/Ajax APIs over the native MAPI
 
 Date: 2026-08-07
-Status: accepted
+Status: superseded by ADR-0002
 
 ## Context
 
