@@ -104,3 +104,14 @@ DB_PORT = 6000
 DB_USER = "crawl_prod"
 DB_PASSWORD = "WNfUSjJZzsf5sn74j4qCQeLp5"
 DB_NAME = "crawler_data_center"
+
+# ==================== MAPI（微博原生 App API）配置 ====================
+# 用于 /weibo/longtext 端点构造 statuses/extend 请求（uid+mid 参数化）。
+# 这些值来自 App 抓包；签名 s/i 经验证可用，{} 仅表示该 mid 无扩展数据。
+MAPI_GSID = "_2AkMvpUuAf8NhqwJRmP8Qzmjmb4Rxyg_EieKZ-bpbJRM3HRl-3D9kqlUttRWJWcA8gH4muqPim7vBRGT4uVmwwg.."
+MAPI_S = "62772b60"           # 请求签名
+MAPI_I = "dirs6dm"            # 签名伴随标识
+MAPI_DID = "c12eff4f7422e24aa153918615a3508373d91bac"  # 设备 ID
+MAPI_AID = "01AR_xW5_q."      # App ID
+MAPI_UA = "samsung-SM-G7108V__weibo__6.12.3__android__android4.3"  # 设备/版本（URL 参数）
+MAPI_FROM = "106C395010"      # 渠道

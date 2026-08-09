@@ -2023,47 +2023,70 @@ async def fetch_user_weibo(uid: str, page: int = 1, since_id: str = "") -> dict:
         return {"ok": -1, "error": error_msg}
 
 
-async def fetch_weibo_longtext(mid: str) -> dict:
-    """通过 H5 详情页获取微博完整扩展信息（statuses/extend 的 H5 等价物）。
+async def fetch_weibo_longtext(uid: str, mid: str) -> dict:
+    """通过 MAPI statuses/extend 获取微博扩展信息（uid+mid 参数化）。
 
-    用浏览器访问 m.weibo.cn/detail/{mid}（浏览器自动完成 Sina Visitor 流程），
-    读取页面 $render_data（含完整 mblog，长文已展开）。仅需 mid。
+    构造 api.weibo.cn/2/statuses/extend 请求：uid 替换 <requestuid>、mid 替换 <requestmid>，
+    其余签名/设备参数（s/i/gsid/did/aid/ua/from）来自 config.MAPI_*。
+    返回 MAPI 原始响应；部分 mid 无扩展数据时会返回 {}（属正常，非签名问题）。
     """
-    global browser_page
     pid = os.getpid()
-    detail_url = f"https://m.weibo.cn/detail/{mid}"
 
-    async with browser_lock:
-        if not browser_page or browser_page.is_closed():
-            print(f"[PID:{pid}][微博长文/H5] 浏览器页面不可用，重新初始化...")
-            await reset_browser_with_new_fingerprint()
+    # 构造 MAPI URL：参数顺序与抓包一致，值不编码以匹配签名计算
+    params = [
+        ("v_f", "2"),
+        ("moduleID", "705"),
+        ("lfid", f"230283{uid}"),
+        ("wb_version", "3314"),
+        ("c", "android"),
+        ("wm", "2468_1001"),
+        ("luicode", "10000198"),
+        ("aid", config.MAPI_AID),
+        ("did", config.MAPI_DID),
+        ("from", config.MAPI_FROM),
+        ("networktype", "wifi"),
+        ("lang", "zh_CN"),
+        ("lcardid", f"107603{uid}_-_WEIBO_SECOND_PROFILE_WEIBO_-_{mid}"),
+        ("skin", "default"),
+        ("i", config.MAPI_I),
+        ("s", config.MAPI_S),
+        ("id", mid),
+        ("has_product", "0"),
+        ("sflag", "1"),
+        ("gsid", config.MAPI_GSID),
+        ("ua", config.MAPI_UA),
+        ("oldwm", "2468_1001"),
+        ("is_recom", "-1"),
+        ("uicode", "10000002"),
+        ("featurecode", "10000085"),
+    ]
+    query = "&".join(f"{k}={v}" for k, v in params)
+    url = f"http://api.weibo.cn/2/statuses/extend?{query}"
 
-        print(f"[PID:{pid}][微博长文/H5] 访问详情页: {detail_url}")
-        try:
-            await browser_page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
-            # $render_data 在详情页初始 HTML 内；访客流程可能需几秒，轮询等待
-            data = None
-            for _ in range(20):
-                data = await browser_page.evaluate("() => window.$render_data || null")
-                if data:
-                    break
-                await asyncio.sleep(0.5)
-            # 兜底：从 HTML 正则提取
-            if not data:
-                html = await browser_page.content()
-                match = re.search(r'var \$render_data = \[(.*?)\]\[0\]\s*\|\|\s*\{\};', html, re.S)
-                if match:
-                    data = json.loads("[" + match.group(1) + "]")[0]
-            if data:
-                status = data.get('status') if isinstance(data, dict) else None
-                print(f"[PID:{pid}][微博长文/H5] ✅ 提取成功" + ("" if status else "（无 status 字段，返回整体）"))
-                return status if status is not None else data
-            print(f"[PID:{pid}][微博长文/H5] ❌ 未找到 $render_data")
-            return {"ok": -1, "error": "未找到 $render_data"}
-        except Exception as e:
-            error_msg = repr(e)[:200]
-            print(f"[PID:{pid}][微博长文/H5] ❌ 异常: {error_msg}")
-            return {"ok": -1, "error": error_msg}
+    # app 风格请求头
+    headers = {
+        "User-Agent": "Weibo/6.12.3 (Android)",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip",
+    }
+
+    print(f"[PID:{pid}][微博长文/MAPI] 请求 uid={uid} mid={mid}")
+
+    try:
+        # 用 httpx（系统解析器）而非 curl-cffi：MAPI 只需普通 GET，无需 TLS 指纹/代理/Cookie，
+        # 且 httpx 不受 curl-cffi 在 macOS + VPN 下的 DNS 解析问题影响。
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, timeout=15)
+            text = response.text
+            print(f"[PID:{pid}][微博长文/MAPI] HTTP {response.status_code} | body {len(text)} 字符")
+            try:
+                return response.json()
+            except Exception:
+                return {"ok": -1, "error": "非 JSON 响应", "body": text[:500]}
+    except Exception as e:
+        error_msg = repr(e)[:200]
+        print(f"[PID:{pid}][微博长文/MAPI] ❌ 异常: {error_msg}")
+        return {"ok": -1, "error": error_msg}
 
 
 async def fetch_user_profile(uid: str) -> dict:
@@ -2223,17 +2246,18 @@ async def get_user_profile(
 
 @app.get("/weibo/longtext")
 async def get_weibo_longtext(
-    mid: str = Query(..., description="微博 MID", min_length=1),
+    uid: str = Query(..., description="用户 UID（对应 <requestuid>）", min_length=1),
+    mid: str = Query(..., description="微博 MID（对应 <requestmid>）", min_length=1),
 ):
     """
-    通过 H5 详情页获取微博完整扩展信息（statuses/extend 的 H5 等价物）
+    通过 MAPI statuses/extend 获取微博扩展信息
 
-    - **mid**: 微博 MID
+    - **uid**: 用户 UID（替换 MAPI URL 中的 <requestuid>）
+    - **mid**: 微博 MID（替换 MAPI URL 中的 <requestmid>）
 
-    抓取 m.weibo.cn/detail/{mid}，提取 $render_data（含完整 mblog，长文已展开）。
-    公开页面，无需 Cookie/签名。uid 在 H5 路径不需要（传入会被忽略）。
+    返回 MAPI 原始响应。签名/设备参数来自 config.MAPI_*。部分 mid 无扩展数据时返回 {}。
     """
-    response = await fetch_weibo_longtext(mid)
+    response = await fetch_weibo_longtext(uid, mid)
     return JSONResponse(content=response)
 
 
