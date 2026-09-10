@@ -1959,8 +1959,8 @@ async def fetch_user_weibo(uid: str, page: int = 1, since_id: str = "") -> dict:
     if since_id:
         url += f"&since_id={since_id}"
 
-    # 构建请求头（使用浏览器真实请求头作为参考）
-    headers = {
+    # 基础请求头（cookie 无关部分）
+    base_headers = {
         "accept": "application/json, text/plain, */*",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
         "client-version": "3.0.0",
@@ -1971,58 +1971,71 @@ async def fetch_user_weibo(uid: str, page: int = 1, since_id: str = "") -> dict:
         "server-version": "v2026.02.06.1",
     }
 
-    # 从数据库获取 Cookie
-    cookie_str = await get_next_cookie()
-    if not cookie_str:
-        print(f"[PID:{pid}][用户微博] ❌ 无可用 Cookie")
-        return {"ok": -1, "error": "无可用 Cookie"}
+    # Cookie 级重试：所有代理+直连均风控时判定为 cookie 被限流（非 IP 问题），
+    # 剔出当前 cookie 换下一个重试，避免坏 cookie 被复用、代理被错误背锅 churn。
+    initial_cookie_count = max(1, len(weibo_cookies))
+    for cookie_attempt in range(1, initial_cookie_count + 1):
+        # 从数据库获取 Cookie
+        cookie_str = await get_next_cookie()
+        if not cookie_str:
+            print(f"[PID:{pid}][用户微博] ❌ 无可用 Cookie")
+            return {"ok": -1, "error": "无可用 Cookie"}
 
-    # 解析 Cookie 字符串为字典
-    cookies = parse_cookie_string(cookie_str)
+        # 解析 Cookie 字符串为字典
+        cookies = parse_cookie_string(cookie_str)
 
-    # 提取 XSRF-TOKEN 并添加到请求头
-    xsrf_token = extract_xsrf_token(cookie_str)
-    if xsrf_token:
-        headers["x-xsrf-token"] = xsrf_token
-        print(f"[PID:{pid}][用户微博] 已提取 XSRF-TOKEN")
-    else:
-        print(f"[PID:{pid}][用户微博] ⚠️ 未找到 XSRF-TOKEN")
-
-    try:
-        print(f"[PID:{pid}][用户微博] 开始请求: {url}")
-
-        # 使用代理重试方式请求
-        response = await fetch_with_proxy_retry(
-            url=url,
-            headers=headers,
-            cookies=cookies,
-            method="GET",
-            max_retries=15,
-            context="用户微博"
-        )
-
-        # 处理返回结果
-        if response.status_code == 200:
-            data = response.json()
-            if data and data.get("ok") == 1:
-                print(f"[PID:{pid}][用户微博] ✅ 采集成功")
-                return data
-            elif data and data.get("ok") == -100:
-                print(f"[PID:{pid}][用户微博] ⚠️ 触发验证码或 Cookie 失效")
-                return {"ok": -1, "error": "触发验证码或 Cookie 失效"}
-            else:
-                error_msg = data.get("msg", "未知错误") if data else "无返回数据"
-                print(f"[PID:{pid}][用户微博] ❌ 返回错误: {error_msg}")
-                return {"ok": -1, "error": error_msg}
+        # 提取 XSRF-TOKEN 并添加到请求头
+        headers = dict(base_headers)
+        xsrf_token = extract_xsrf_token(cookie_str)
+        if xsrf_token:
+            headers["x-xsrf-token"] = xsrf_token
+            print(f"[PID:{pid}][用户微博] 已提取 XSRF-TOKEN")
         else:
-            error_msg = f"HTTP {response.status_code}"
-            print(f"[PID:{pid}][用户微博] ❌ 请求失败: {error_msg}")
+            print(f"[PID:{pid}][用户微博] ⚠️ 未找到 XSRF-TOKEN")
+
+        try:
+            print(f"[PID:{pid}][用户微博] 开始请求: {url}")
+
+            # 使用代理重试方式请求
+            response = await fetch_with_proxy_retry(
+                url=url,
+                headers=headers,
+                cookies=cookies,
+                method="GET",
+                max_retries=15,
+                context="用户微博"
+            )
+
+            # 处理返回结果
+            if response.status_code == 200:
+                data = response.json()
+                if data and data.get("ok") == 1:
+                    print(f"[PID:{pid}][用户微博] ✅ 采集成功")
+                    return data
+                elif data and data.get("ok") == -100:
+                    print(f"[PID:{pid}][用户微博] ⚠️ 触发验证码或 Cookie 失效")
+                    return {"ok": -1, "error": "触发验证码或 Cookie 失效"}
+                else:
+                    error_msg = data.get("msg", "未知错误") if data else "无返回数据"
+                    print(f"[PID:{pid}][用户微博] ❌ 返回错误: {error_msg}")
+                    return {"ok": -1, "error": error_msg}
+            else:
+                error_msg = f"HTTP {response.status_code}"
+                print(f"[PID:{pid}][用户微博] ❌ 请求失败: {error_msg}")
+                return {"ok": -1, "error": error_msg}
+
+        except Exception as e:
+            error_msg = str(e)
+            # 直连也触发风控 → 跨多个 IP 的常量是 cookie，判定为 cookie 被限流，
+            # 剔出换下一个；其他异常（connect/TLS/超时）不归因 cookie，直接返回。
+            if "所有代理和直连均触发风控" in error_msg:
+                print(f"[PID:{pid}][用户微博] 🗑️ 所有代理+直连均风控，判定 cookie 失效，换下一个重试 ({cookie_attempt}/{initial_cookie_count})")
+                await mark_cookie_invalid(cookie_str)
+                continue
+            print(f"[PID:{pid}][用户微博] ❌ 异常: {error_msg[:200]}")
             return {"ok": -1, "error": error_msg}
 
-    except Exception as e:
-        error_msg = str(e)
-        print(f"[PID:{pid}][用户微博] ❌ 异常: {error_msg[:200]}")
-        return {"ok": -1, "error": error_msg}
+    return {"ok": -1, "error": f"已轮换 {initial_cookie_count} 个 cookie 均触发风控，cookie 池可能整体被限流"}
 
 
 async def fetch_weibo_longtext(uid: str, mid: str) -> dict:
