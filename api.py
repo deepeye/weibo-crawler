@@ -1752,7 +1752,7 @@ async def fetch_with_proxy_retry(
     增强功能：
     1. 动态从代理池轮询获取代理，最多尝试 30 个不同 IP
     2. 超时 >= 360 秒才标记代理失效
-    3. 其他错误（风控、HTTP错误、TLS 握手失败）不标记失效，直接重试；无法连接的死代理标记失效以触发重获
+    3. 连接失败（含 TLS 握手失败）标记失效以触发池耗尽→重新获取；HTTP 错误等其他异常不标记，直接重试
     4. 每次重试自动更换 HTTP 指纹（UA、headers）
     5. 智能延迟模拟人类行为
     6. 优化资源管理，避免文件描述符耗尽
@@ -1871,17 +1871,11 @@ async def fetch_with_proxy_retry(
                             )
                         continue
 
-                    # 连接失败 - 区分死代理与 TLS 握手失败
+                    # 连接失败 - 死代理（curl 7 无法连接）或 TLS 不通的坏代理（curl 35），
+                    # 一律踢出以触发池耗尽→释放流程→重新 get / 直连兜底
                     elif "connect" in error_msg.lower() or "connection" in error_msg.lower():
-                        err_low = error_msg.lower()
-                        # TLS/SSL 握手失败（curl 35）= 代理可达但 curl-cffi TLS 问题，非死代理：
-                        # 不踢出（浏览器路径仍可用该 IP），重试下一个
-                        if "tls" in err_low or "ssl" in err_low or "invalid library" in err_low or "(35)" in error_msg:
-                            console.print(f"[yellow][PID:{pid}][{context}] ❌ TLS 握手失败（代理可达）: {error_msg[:100]}，不标记失效[/yellow]")
-                        else:
-                            # 无法连接/连接被拒 = 死代理，踢出以触发池耗尽→重新获取
-                            console.print(f"[yellow][PID:{pid}][{context}] ❌ 代理无法连接（死代理）: {error_msg[:100]}，标记失效[/yellow]")
-                            await proxy_manager.mark_proxy_failed(proxy)
+                        console.print(f"[yellow][PID:{pid}][{context}] ❌ 代理连接失败: {error_msg[:100]}，标记失效[/yellow]")
+                        await proxy_manager.mark_proxy_failed(proxy)
                         continue
 
                     # 其他异常 - 不标记失败，仅重试
