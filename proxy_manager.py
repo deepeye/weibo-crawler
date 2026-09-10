@@ -149,16 +149,10 @@ class ProxyManager:
                             break
                     else:
                         console.print(f"[dim][PID:{pid}] HTTP接口 JSON 响应: {json_data}[/dim]")
-                        # 共享池无可用通道 → 触发强制释放流程
+                        # 共享池无可用通道 → 触发强制释放流程（provider 通常以 400 返回，此处兜底 200 情况）
                         if isinstance(json_data, dict) and json_data.get("code") == "NO_AVAILABLE_CHANNEL":
-                            if _skip_release:
-                                console.print(f"[yellow][PID:{pid}] NO_AVAILABLE_CHANNEL（释放流程内部 get，不重复触发释放）[/yellow]")
-                                break
-                            console.print(f"[yellow][PID:{pid}] NO_AVAILABLE_CHANNEL：共享池已满，触发强制释放流程...[/yellow]")
-                            released = await self._release_and_reget()
-                            if released:
+                            if await self._handle_no_available_channel(_skip_release):
                                 return True
-                            console.print(f"[yellow][PID:{pid}] 强制释放未成功，回退到共享文件[/yellow]")
                             break
                         data = self._normalize_proxy_response(json_data)
 
@@ -209,6 +203,11 @@ class ProxyManager:
                     else:
                         console.print(f"[yellow][PID:{pid}] 已达最大重试次数，尝试从文件读取[/yellow]")
                         break
+                # 共享池无可用通道：provider 以 HTTP 400 + NO_AVAILABLE_CHANNEL body 返回
+                elif status_code == 400 and self._is_no_available_channel(e.response):
+                    if await self._handle_no_available_channel(_skip_release):
+                        return True
+                    break
                 else:
                     console.print(f"[yellow][PID:{pid}] HTTP接口返回错误 {status_code}[/yellow]")
                     break
@@ -379,6 +378,31 @@ class ProxyManager:
             console.print(f"[green][PID:{pid}] ✅ 已释放 {json_data.get('data')} 个 IP: {ip_param}[/green]")
             return True
         console.print(f"[yellow][PID:{pid}] 释放 IP 返回非 SUCCESS: {json_data}[/yellow]")
+        return False
+
+    def _is_no_available_channel(self, response) -> bool:
+        """判断响应是否为 NO_AVAILABLE_CHANNEL（provider 以 HTTP 400 + 该 code 返回）"""
+        try:
+            body = response.json()
+        except Exception:
+            return False
+        return isinstance(body, dict) and body.get("code") == "NO_AVAILABLE_CHANNEL"
+
+    async def _handle_no_available_channel(self, _skip_release: bool) -> bool:
+        """检测到 NO_AVAILABLE_CHANNEL 后的处理：触发强制释放或跳过（释放流程内部复用）
+
+        Returns:
+            True 表示已通过释放流程拿到新代理（调用方应 return True）；
+            False 表示跳过或释放失败（调用方应回退/返回 False）
+        """
+        if _skip_release:
+            console.print(f"[yellow][PID:{pid}] NO_AVAILABLE_CHANNEL（释放流程内部 get，不重复触发释放）[/yellow]")
+            return False
+        console.print(f"[yellow][PID:{pid}] NO_AVAILABLE_CHANNEL：共享池已满，触发强制释放流程...[/yellow]")
+        released = await self._release_and_reget()
+        if released:
+            return True
+        console.print(f"[yellow][PID:{pid}] 强制释放未成功，回退到共享文件[/yellow]")
         return False
 
     async def _release_and_reget(self) -> bool:
