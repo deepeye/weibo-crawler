@@ -74,7 +74,7 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 PROXY_ENABLED = False
 
 # HTTP 代理接口配置
-PROXY_HTTP_URL = "https://exclusive.proxy.qg.net/get?key=5CDBEC47&num=1&area=&isp=0&format=json&distinct=true&keep_alive=1440"
+PROXY_HTTP_URL = "https://exclusive.proxy.qg.net/get?key=5CDBEC47&num=3&area=&isp=0&format=json&distinct=true&keep_alive=1440"
 PROXY_HTTP_PARAMS = {}
 PROXY_AUTH_USER = "5CDBEC47"
 PROXY_AUTH_PASSWORD = "48BC8939D827"
@@ -86,6 +86,14 @@ PROXY_TIMEOUT_THRESHOLD = 360  # 超时超过此秒数才标记代理失效
 # 代理池共享文件（多 worker 共享）
 PROXY_CACHE_FILE = "/tmp/weibo_proxy_cache.json"  # 代理池缓存文件路径
 PROXY_CACHE_MAX_AGE = 90  # 缓存文件最大有效期（秒），超过此时间视为过期
+
+# 代理池强制释放配置（get 返回 NO_AVAILABLE_CHANNEL 时触发）
+PROXY_QUERY_URL = "https://exclusive.proxy.qg.net/query?key=5CDBEC47"  # 查询池子在用 IP
+PROXY_DELETE_URL = "https://exclusive.proxy.qg.net/delete?key=5CDBEC47"  # 释放指定 IP（&ip=ip1,ip2,...）
+PROXY_RELEASE_NUM = 3  # 单次释放的 IP 数量
+PROXY_RELEASE_MAX_ATTEMPTS = 3  # delete→get 最多重试次数，全部失败则放弃
+PROXY_RELEASE_LOCK_FILE = "/tmp/weibo_proxy_release.lock"  # 多 worker 释放互斥锁文件
+PROXY_RELEASE_LOCK_TIMEOUT = 30  # 获取释放锁的最长等待秒数，超时跳过本次释放
 
 # ==================== 废弃：Redis 代理池配置 ====================
 # 已迁移到 HTTP 接口，以下配置不再使用

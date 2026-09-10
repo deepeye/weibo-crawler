@@ -5,6 +5,8 @@
 import os
 import json
 import asyncio
+import fcntl
+import time
 import httpx
 from rich.console import Console
 from pathlib import Path
@@ -103,16 +105,19 @@ class ProxyManager:
         """构建带认证信息的代理 URL"""
         return f"http://{config.PROXY_AUTH_USER}:{config.PROXY_AUTH_PASSWORD}@{proxy['ip']}:{proxy['port']}"
 
-    async def load_proxies_from_http(self, max_retries: int = 3) -> bool:
+    async def load_proxies_from_http(self, max_retries: int = 3, _skip_release: bool = False) -> bool:
         """从 HTTP 接口获取代理列表（支持 429 错误重试 + 多 worker 文件共享）
 
         策略：
         1. 尝试从 HTTP 接口获取代理
         2. 成功后写入共享文件，供其他 worker 使用
         3. 失败时从共享文件读取（如果未过期）
+        4. 遇到 NO_AVAILABLE_CHANNEL 时触发强制释放流程（_skip_release=True 时跳过，供释放流程内部复用）
 
         Args:
             max_retries: 遇到 429 错误时的最大重试次数
+            _skip_release: True 时遇到 NO_AVAILABLE_CHANNEL 直接返回 False（不触发释放、不读共享文件），
+                由 _release_and_reget 复用本方法做 get+加载
 
         Returns:
             成功返回 True，失败返回 False（保留旧代理池）
@@ -144,6 +149,17 @@ class ProxyManager:
                             break
                     else:
                         console.print(f"[dim][PID:{pid}] HTTP接口 JSON 响应: {json_data}[/dim]")
+                        # 共享池无可用通道 → 触发强制释放流程
+                        if isinstance(json_data, dict) and json_data.get("code") == "NO_AVAILABLE_CHANNEL":
+                            if _skip_release:
+                                console.print(f"[yellow][PID:{pid}] NO_AVAILABLE_CHANNEL（释放流程内部 get，不重复触发释放）[/yellow]")
+                                break
+                            console.print(f"[yellow][PID:{pid}] NO_AVAILABLE_CHANNEL：共享池已满，触发强制释放流程...[/yellow]")
+                            released = await self._release_and_reget()
+                            if released:
+                                return True
+                            console.print(f"[yellow][PID:{pid}] 强制释放未成功，回退到共享文件[/yellow]")
+                            break
                         data = self._normalize_proxy_response(json_data)
 
                     if not data:
@@ -201,7 +217,9 @@ class ProxyManager:
                 console.print(f"[yellow][PID:{pid}] HTTP接口调用失败: {e}[/yellow]")
                 break
 
-        # 🔥 第二步：HTTP 接口失败，尝试从共享文件读取
+        # 🔥 第二步：HTTP 接口失败，尝试从共享文件读取（释放流程内部调用跳过，避免读到已删除的旧代理）
+        if _skip_release:
+            return False
         console.print(f"[cyan][PID:{pid}] HTTP接口失败，尝试从共享文件读取...[/cyan]")
         return await self._load_proxies_from_file()
 
@@ -303,6 +321,128 @@ class ProxyManager:
         except Exception as e:
             console.print(f"[yellow][PID:{pid}] 从共享文件加载代理失败: {e}[/yellow]")
             return False
+
+    async def _query_inuse_ips(self) -> list[str]:
+        """查询代理池当前在用 IP 列表（共享池，含其他客户端占用）
+
+        解析 query 响应 data.tasks[].ips[].proxy_ip 并扁平化。
+
+        Returns:
+            在用 IP 列表（按 query 返回顺序）；查询失败返回空列表
+        """
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(config.PROXY_QUERY_URL)
+                response.raise_for_status()
+                json_data = response.json()
+        except Exception as e:
+            console.print(f"[yellow][PID:{pid}] 查询在用 IP 失败: {e}[/yellow]")
+            return []
+
+        if not isinstance(json_data, dict) or json_data.get("code") != "SUCCESS":
+            console.print(f"[yellow][PID:{pid}] 查询在用 IP 返回非 SUCCESS: {json_data}[/yellow]")
+            return []
+
+        tasks = (json_data.get("data") or {}).get("tasks") or []
+        ips: list[str] = []
+        for task in tasks:
+            for ip_obj in task.get("ips") or []:
+                ip = str(ip_obj.get("proxy_ip", "")).strip()
+                if ip:
+                    ips.append(ip)
+        console.print(f"[dim][PID:{pid}] 查询到 {len(ips)} 个在用 IP[/dim]")
+        return ips
+
+    async def _delete_ips(self, ips: list[str]) -> bool:
+        """释放指定的代理 IP（共享池强制释放，可强杀活跃租约）
+
+        Args:
+            ips: 待释放的 IP 列表
+
+        Returns:
+            成功返回 True，失败返回 False
+        """
+        if not ips:
+            return False
+        ip_param = ",".join(ips)
+        url = f"{config.PROXY_DELETE_URL}&ip={ip_param}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                json_data = response.json()
+        except Exception as e:
+            console.print(f"[yellow][PID:{pid}] 释放 IP 失败: {e}[/yellow]")
+            return False
+
+        if isinstance(json_data, dict) and json_data.get("code") == "SUCCESS":
+            console.print(f"[green][PID:{pid}] ✅ 已释放 {json_data.get('data')} 个 IP: {ip_param}[/green]")
+            return True
+        console.print(f"[yellow][PID:{pid}] 释放 IP 返回非 SUCCESS: {json_data}[/yellow]")
+        return False
+
+    async def _release_and_reget(self) -> bool:
+        """共享池无可用通道时强制释放 IP 并重新获取（多 worker 文件锁互斥）
+
+        流程（持文件锁，fcntl.flock 进程崩溃自动释放）：
+        1. 先 get 一次：若其他 worker 已补满池子，直接返回，避免无谓删除
+        2. 仍 NO_AVAILABLE_CHANNEL → query 取前 N 个在用 IP → delete → 进入下一轮 get
+        3. 最多 PROXY_RELEASE_MAX_ATTEMPTS 次，全败则返回 False
+
+        文件锁获取超时（PROXY_RELEASE_LOCK_TIMEOUT）则跳过本次释放，
+        避免无限阻塞所有 worker 的代理获取。
+
+        Returns:
+            成功获取新代理返回 True，全部失败返回 False
+        """
+        lock_path = Path(config.PROXY_RELEASE_LOCK_FILE)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = open(lock_path, "w")
+        timeout = config.PROXY_RELEASE_LOCK_TIMEOUT
+        deadline = time.monotonic() + timeout
+
+        # 非阻塞获取文件锁，超时则跳过本次释放
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    lock_fd.close()
+                    console.print(
+                        f"[yellow][PID:{pid}] 释放锁被其他 worker 占用，等待 {timeout}s 超时，"
+                        f"跳过本次释放[/yellow]"
+                    )
+                    return False
+                await asyncio.sleep(0.5)
+
+        console.print(f"[cyan][PID:{pid}] 已获取释放锁，开始强制释放流程[/cyan]")
+        try:
+            for attempt in range(1, config.PROXY_RELEASE_MAX_ATTEMPTS + 1):
+                # 先 get：其他 worker 可能已补满池子，避免无谓删除
+                got = await self.load_proxies_from_http(_skip_release=True)
+                if got:
+                    console.print(f"[green][PID:{pid}] 释放流程第 {attempt} 轮：get 成功，无需释放[/green]")
+                    return True
+
+                # 仍 NO_AVAILABLE_CHANNEL → query 取前 N 个 + delete
+                ips = await self._query_inuse_ips()
+                target = ips[: config.PROXY_RELEASE_NUM]
+                if not target:
+                    console.print(f"[yellow][PID:{pid}] 释放流程第 {attempt} 轮：无可释放 IP，直接重试 get[/yellow]")
+                    continue
+                await self._delete_ips(target)
+                # 下一轮循环开头会再 get
+            console.print(
+                f"[red][PID:{pid}] 释放流程 {config.PROXY_RELEASE_MAX_ATTEMPTS} 次全部失败，放弃[/red]"
+            )
+            return False
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_fd.close()
 
     async def get_next_proxy(self) -> str | None:
         """获取下一个可用代理
