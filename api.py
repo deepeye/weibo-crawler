@@ -1737,6 +1737,34 @@ def get_random_http_fingerprint() -> dict:
     }
 
 
+class CookieBlockedError(Exception):
+    """直连也触发风控 → 跨多个 IP 的常量是 cookie，判定为 cookie 被限流。
+
+    由 fetch_with_proxy_retry 在直连探测/直连兜底确认后抛出，
+    调用方应踢出 cookie 换下一个重试，而不是归因代理。
+    """
+
+
+async def direct_probe(url: str, headers: dict, cookies: dict, method: str, context: str) -> int | None:
+    """403 归因探测：不走代理、用同一个 cookie 直连请求一次，返回 HTTP 状态码。
+
+    网络失败（超时/连接错误）返回 None，表示无法归因。
+    """
+    pid = os.getpid()
+    fingerprint = get_random_http_fingerprint()
+    merged_headers = {**fingerprint, **headers}
+    try:
+        async with AsyncSession(impersonate="chrome120") as session:
+            if method == "GET":
+                response = await session.get(url, headers=merged_headers, cookies=cookies, timeout=15)
+            else:
+                response = await session.post(url, headers=merged_headers, cookies=cookies, timeout=15)
+            return response.status_code
+    except Exception as e:
+        print(f"[PID:{pid}][{context}] 🧪 直连探测异常: {str(e)[:80]}")
+        return None
+
+
 async def fetch_with_proxy_retry(
     url: str,
     headers: dict,
@@ -1759,6 +1787,7 @@ async def fetch_with_proxy_retry(
     """
     pid = os.getpid()
     last_error = None
+    probed = False  # 首个风控响应时做一次直连归因探测
 
     # 🔥 创建单个 session 重用（避免每次重试都创建新 session）
     try:
@@ -1812,6 +1841,21 @@ async def fetch_with_proxy_retry(
                     # 🔍 检测风控或 HTTP 错误 - 触发风控后立即更换代理
                     if response.status_code in [432, 418, 403, 414]:
                         console.print(f"[yellow][PID:{pid}][{context}] ⚠️ 触发风控 (HTTP {response.status_code})，立即更换代理[/yellow]")
+
+                        # 🧪 首个风控响应时用同一个 cookie 直连探测一次，
+                        # 区分代理 IP 被封还是 cookie 被限流（每次调用只探测一次）
+                        if not probed:
+                            probed = True
+                            probe_status = await direct_probe(url, headers, cookies, method, context)
+                            if probe_status in [432, 418, 403, 401]:
+                                # 直连也风控 → 跨多个 IP 的常量是 cookie：
+                                # 不踢代理（无辜）、跳过长冷却，交由调用方踢 cookie 换下一个
+                                console.print(f"[yellow][PID:{pid}][{context}] 🧪 同 cookie 直连探测: {probe_status} → 归因: COOKIE 失效[/yellow]")
+                                raise CookieBlockedError(f"直连探测也触发风控 (HTTP {probe_status})，归因: COOKIE 失效")
+                            elif probe_status is not None:
+                                console.print(f"[yellow][PID:{pid}][{context}] 🧪 同 cookie 直连探测: {probe_status} → 归因: 代理 IP[/yellow]")
+                            else:
+                                console.print(f"[yellow][PID:{pid}][{context}] 🧪 直连探测失败 (网络错误)，无法归因，按现有流程继续[/yellow]")
 
                         # 🔥 关键修复：触发风控的代理标记为失效，避免重复使用
                         await proxy_manager.mark_proxy_failed(proxy)
@@ -1886,6 +1930,9 @@ async def fetch_with_proxy_retry(
             # 所有代理都失败了
             console.print(f"[red][PID:{pid}][{context}] 🔴 已尝试 {max_retries} 个代理均失败，放弃请求[/red]")
 
+    except CookieBlockedError:
+        # cookie 归因判定异常，原样透传给调用方处理
+        raise
     except Exception as e:
         # Session 创建失败
         console.print(f"[red][PID:{pid}][{context}] ❌ 创建 session 失败: {e}[/red]")
@@ -1921,8 +1968,8 @@ async def fetch_with_proxy_retry(
 
             # 检测风控状态码
             if response.status_code in [432, 418, 403, 401]:
-                print(f"[PID:{pid}][{context}] 🔴 直连也触发风控 (HTTP {response.status_code})")
-                raise Exception(f"所有代理和直连均触发风控 (HTTP {response.status_code})")
+                print(f"[PID:{pid}][{context}] 🧪 直连兜底也风控 (HTTP {response.status_code}) → 归因: COOKIE 失效")
+                raise CookieBlockedError(f"所有代理耗尽后直连也触发风控 (HTTP {response.status_code})，归因: COOKIE 失效")
 
             print(f"[PID:{pid}][{context}] ✅ 直连请求成功 (HTTP {response.status_code}, 耗时 {elapsed:.2f}s) [curl_cffi/Chrome120]")
 
@@ -1944,6 +1991,9 @@ async def fetch_with_proxy_retry(
 
             return CompatibleResponse(response)
 
+    except CookieBlockedError:
+        # cookie 归因判定异常，原样透传给调用方处理
+        raise
     except Exception as e:
         # 直连也失败，抛出错误
         raise Exception(f"[{context}] 已尝试 {max_retries} 个代理和直连均失败: {str(e)}")
@@ -2024,14 +2074,15 @@ async def fetch_user_weibo(uid: str, page: int = 1, since_id: str = "") -> dict:
                 print(f"[PID:{pid}][用户微博] ❌ 请求失败: {error_msg}")
                 return {"ok": -1, "error": error_msg}
 
+        except CookieBlockedError:
+            # 直连也触发风控 → 跨多个 IP 的常量是 cookie，判定为 cookie 被限流，
+            # 不踢代理（fetch_with_proxy_retry 已跳过），剔出 cookie 短暂停后换下一个。
+            print(f"[PID:{pid}][用户微博] 🍪 直连也风控，判定 cookie 被限流，不踢代理，换下一个 cookie ({cookie_attempt}/{initial_cookie_count})")
+            await mark_cookie_invalid(cookie_str)
+            await asyncio.sleep(random.uniform(2, 4))
+            continue
         except Exception as e:
             error_msg = str(e)
-            # 直连也触发风控 → 跨多个 IP 的常量是 cookie，判定为 cookie 被限流，
-            # 剔出换下一个；其他异常（connect/TLS/超时）不归因 cookie，直接返回。
-            if "所有代理和直连均触发风控" in error_msg:
-                print(f"[PID:{pid}][用户微博] 🗑️ 所有代理+直连均风控，判定 cookie 失效，换下一个重试 ({cookie_attempt}/{initial_cookie_count})")
-                await mark_cookie_invalid(cookie_str)
-                continue
             print(f"[PID:{pid}][用户微博] ❌ 异常: {error_msg[:200]}")
             return {"ok": -1, "error": error_msg}
 
@@ -2204,6 +2255,13 @@ async def fetch_user_profile(uid: str) -> dict:
                 print(f"[PID:{pid}][用户资料] ❌ 失败 (尝试 {attempt + 1}): {last_error}")
                 continue
 
+        except CookieBlockedError as e:
+            # 直连也触发风控 → 判定 cookie 被限流，踢出换下一个（此前该场景被漏掉，坏 cookie 会留在池里）
+            last_error = str(e)
+            print(f"[PID:{pid}][用户资料] 🍪 直连也风控，判定 cookie 被限流，标记为无效 (尝试 {attempt + 1})")
+            await mark_cookie_invalid(cookie_str)
+            await asyncio.sleep(random.uniform(2, 4))
+            continue
         except Exception as e:
             last_error = str(e)
             print(f"[PID:{pid}][用户资料] ❌ 异常 (尝试 {attempt + 1}): {last_error[:200]}")
