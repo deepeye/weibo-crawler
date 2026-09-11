@@ -1771,7 +1771,8 @@ async def fetch_with_proxy_retry(
     cookies: dict,
     method: str = "GET",
     max_retries: int = 30,  # 最多尝试 30 个不同 IP
-    context: str = "请求"
+    context: str = "请求",
+    cookie_corroboration: bool = False,  # cookie 归因模式：多 IP 佐证后才探测/踢 cookie
 ) -> httpx.Response:
     """使用代理重试机制发送 HTTP 请求（新版 - 动态轮询代理池）
 
@@ -1784,10 +1785,17 @@ async def fetch_with_proxy_retry(
     4. 每次重试自动更换 HTTP 指纹（UA、headers）
     5. 智能延迟模拟人类行为
     6. 优化资源管理，避免文件描述符耗尽
+
+    cookie_corroboration=True 时进入 cookie 归因模式（用户微博专用）：
+    - 单个 403 可能只是该 IP 被封，累计 >=2 个不同 IP 对同一 cookie 403 才做直连探测，
+      探测也风控才抛 CookieBlockedError（踢 cookie），避免单点误伤；
+    - 403 的 IP 仍标记失效但只做短抖动，不做长冷却；
+    - HTTP 401 视为会话失效，立即抛 CookieBlockedError。
     """
     pid = os.getpid()
     last_error = None
     probed = False  # 首个风控响应时做一次直连归因探测
+    risk_ips: set[str] = set()  # 归因模式下对同一 cookie 返回风控状态码的不同代理 IP
 
     # 🔥 创建单个 session 重用（避免每次重试都创建新 session）
     try:
@@ -1838,13 +1846,25 @@ async def fetch_with_proxy_retry(
 
                     elapsed = time.time() - start_time
 
+                    # HTTP 401 未登录/会话失效，与 IP 无关，立即归因 cookie（仅归因模式）
+                    if cookie_corroboration and response.status_code == 401:
+                        console.print(f"[yellow][PID:{pid}][{context}] 🍪 HTTP 401 未登录/会话失效，归因: COOKIE 失效[/yellow]")
+                        raise CookieBlockedError(f"HTTP 401 未登录/会话失效，归因: COOKIE 失效")
+
                     # 🔍 检测风控或 HTTP 错误 - 触发风控后立即更换代理
                     if response.status_code in [432, 418, 403, 414]:
                         console.print(f"[yellow][PID:{pid}][{context}] ⚠️ 触发风控 (HTTP {response.status_code})，立即更换代理[/yellow]")
 
-                        # 🧪 首个风控响应时用同一个 cookie 直连探测一次，
+                        if cookie_corroboration:
+                            # 归因模式：累计 >=2 个不同 IP 对同一 cookie 403 才做直连探测
+                            risk_ips.add(proxy)
+                            should_probe = len(risk_ips) >= 2
+                        else:
+                            should_probe = True  # 非归因模式维持原行为：首个风控响应即探测
+
+                        # 🧪 用同一个 cookie 直连探测一次，
                         # 区分代理 IP 被封还是 cookie 被限流（每次调用只探测一次）
-                        if not probed:
+                        if not probed and should_probe:
                             probed = True
                             probe_status = await direct_probe(url, headers, cookies, method, context)
                             if probe_status in [432, 418, 403, 401]:
@@ -1861,10 +1881,14 @@ async def fetch_with_proxy_retry(
                         await proxy_manager.mark_proxy_failed(proxy)
                         console.print(f"[yellow][PID:{pid}][{context}] 🗑️ 已将触发风控的代理标记为失效[/yellow]")
 
-                        # 进入风控冷却期
-                        cooldown = config.CAPTCHA_COOLDOWN + random.uniform(3, 8)
-                        console.print(f"[yellow][PID:{pid}][{context}] ⏰ 进入风控冷却期 {cooldown:.1f}s[/yellow]")
-                        await asyncio.sleep(cooldown)
+                        if cookie_corroboration:
+                            # 归因模式未佐证前只做短抖动，长冷却保留给 cookie 归因路径的代价
+                            await asyncio.sleep(random.uniform(1, 3))
+                        else:
+                            # 进入风控冷却期
+                            cooldown = config.CAPTCHA_COOLDOWN + random.uniform(3, 8)
+                            console.print(f"[yellow][PID:{pid}][{context}] ⏰ 进入风控冷却期 {cooldown:.1f}s[/yellow]")
+                            await asyncio.sleep(cooldown)
 
                         # 继续尝试下一个代理
                         continue
@@ -1895,6 +1919,9 @@ async def fetch_with_proxy_retry(
 
                     return CompatibleResponse(response)
 
+                except CookieBlockedError:
+                    # cookie 归因判定异常，立即向调用方透传，不再消耗剩余代理
+                    raise
                 except Exception as e:
                     elapsed = time.time() - start_time
                     error_msg = str(e)
@@ -2017,8 +2044,8 @@ async def fetch_user_weibo(uid: str, page: int = 1, since_id: str = "") -> dict:
         "priority": "u=1, i",
         "referer": f"https://weibo.com/u/{uid}",
         "x-requested-with": "XMLHttpRequest",
-        # 重要：服务端版本号，风控可能会检查
-        "server-version": "v2026.02.06.1",
+        # 重要：服务端版本号，风控可能会检查（随微博发版会过期，需定期从登录浏览器抓包更新）
+        "server-version": config.WEIBO_SERVER_VERSION,
     }
 
     # Cookie 级重试：所有代理+直连均风控时判定为 cookie 被限流（非 IP 问题），
@@ -2046,14 +2073,15 @@ async def fetch_user_weibo(uid: str, page: int = 1, since_id: str = "") -> dict:
         try:
             print(f"[PID:{pid}][用户微博] 开始请求: {url}")
 
-            # 使用代理重试方式请求
+            # 使用代理重试方式请求（cookie 归因模式：多 IP 佐证后才踢 cookie）
             response = await fetch_with_proxy_retry(
                 url=url,
                 headers=headers,
                 cookies=cookies,
                 method="GET",
                 max_retries=15,
-                context="用户微博"
+                context="用户微博",
+                cookie_corroboration=True
             )
 
             # 处理返回结果

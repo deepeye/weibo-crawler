@@ -69,12 +69,15 @@ COOKIES = [
 # User-Agent
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 
+# weibo.com ajax 请求头 server-version（从登录浏览器抓包获取，随微博发版会过期，需定期更新）
+WEIBO_SERVER_VERSION = "v2026.02.06.1"
+
 # ==================== 代理配置 ====================
 # 代理启用开关（设置为 False 禁用代理）
 PROXY_ENABLED = False
 
 # HTTP 代理接口配置
-PROXY_HTTP_URL = "https://exclusive.proxy.qg.net/get?key=5CDBEC47&num=3&area=&isp=0&format=json&distinct=true&keep_alive=1440"
+PROXY_HTTP_URL = "https://exclusive.proxy.qg.net/get?key=5CDBEC47&num=6&area=&isp=0&format=json&distinct=true&keep_alive=1440"
 PROXY_HTTP_PARAMS = {}
 PROXY_AUTH_USER = "5CDBEC47"
 PROXY_AUTH_PASSWORD = "48BC8939D827"
